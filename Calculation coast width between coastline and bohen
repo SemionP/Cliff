@@ -1,0 +1,207 @@
+import arcpy
+import os
+import math
+import sys
+import time
+
+# === User-defined paths ===
+# The line where points will be sampled (Coastline)
+base_line_fc = r"C:\Users\semion.p\Desktop\Coastline\Coast.shp"
+# The line to intersect with (Gag Mazok - your "blue line")
+target_line_fc = r"C:\Users\semion.p\Desktop\Gag\Gag.shp"
+# *** THIS IS YOUR PRIMARY OUTPUT FILE: Lines will be cut at the intersection ***
+output_fc = r"C:\Users\semion.p\Desktop\Rohav\width_lines_forced_horizontal_5m.shp" # Changed output name for this density
+
+# Debugging outputs (will be created in the same folder as output_fc)
+# These files show the full projected lines and intersection points for troubleshooting.
+temp_projected_lines_fc = r"C:\Users\semion.p\Desktop\Rohav\temp_projected_lines_forced.shp"
+temp_intersection_points_fc = r"C:\Users\semion.p\Desktop\Rohav\temp_intersection_points_forced.shp"
+
+# === Parameters ===
+spacing_m = 5           # *** UPDATED: Distance (in meters) between sampling points along the BASE line (now 5m) ***
+search_distance_east = 100000 # EXTREMELY LARGE HORIZONTAL SEARCH DISTANCE (100 KILOMETERS)
+                              # This ensures the line extends far enough East to cross Gag Mazok.
+
+# === END PARAMETERS ===
+
+# === Preparation ===
+arcpy.env.overwriteOutput = True
+spatial_ref = arcpy.Describe(base_line_fc).spatialReference
+
+print("--- Script Start (FORCED Horizontal East-West Lines - 5m Spacing) ---")
+print(f"Working directory for outputs: {os.path.dirname(output_fc)}")
+print(f"Spatial Reference: {spatial_ref.name}")
+
+# --- Step 1: Pre-check and Repair Geometry ---
+print("\n--- Step 1: Repairing Input Geometries ---")
+input_fcs = [base_line_fc, target_line_fc]
+output_dir_for_checks = os.path.dirname(output_fc)
+
+for fc in input_fcs:
+    print(f"  Attempting to repair geometry for: {fc}")
+    try:
+        if not os.path.exists(output_dir_for_checks):
+            os.makedirs(output_dir_for_checks)
+        arcpy.RepairGeometry_management(fc)
+        print(f"  Geometry repair attempted for {fc}.")
+    except arcpy.ExecuteError:
+        messages = arcpy.GetMessages(2)
+        arcpy.AddError(f"ArcPy error during geometry repair for {fc}: {messages}")
+        sys.exit("Script terminated due to geometry repair error.")
+    except Exception as e:
+        arcpy.AddError(f"General error during geometry repair for {fc}: {e}")
+        sys.exit("Script terminated due to general error during geometry repair.")
+
+# --- Step 2: Clean up previous outputs (including debug files) ---
+print("\n--- Step 2: Cleaning up previous outputs ---")
+for fc_to_delete in [output_fc, temp_projected_lines_fc, temp_intersection_points_fc]:
+    if arcpy.Exists(fc_to_delete):
+        try:
+            arcpy.Delete_management(fc_to_delete)
+            print(f"  Deleted existing: {fc_to_delete}")
+        except arcpy.ExecuteError:
+            arcpy.AddWarning(f"  Could not delete {fc_to_delete}. It might be locked. Manual deletion might be required.")
+        except Exception as e:
+            arcpy.AddWarning(f"  Error deleting {fc_to_delete}: {e}")
+
+# --- Step 3: Create output feature classes ---
+print("\n--- Step 3: Creating output feature classes ---")
+arcpy.CreateFeatureclass_management(
+    out_path=os.path.dirname(output_fc),
+    out_name=os.path.basename(output_fc),
+    geometry_type="POLYLINE",
+    spatial_reference=spatial_ref
+)
+arcpy.AddField_management(output_fc, "dist_m", "DOUBLE")
+arcpy.AddField_management(output_fc, "Azimuth", "SHORT") # Azimuth will be 90 (East)
+print(f"  Output width lines FC created: {output_fc}")
+
+# Create debug FCs
+arcpy.CreateFeatureclass_management(
+    out_path=os.path.dirname(temp_projected_lines_fc),
+    out_name=os.path.basename(temp_projected_lines_fc),
+    geometry_type="POLYLINE",
+    spatial_reference=spatial_ref
+)
+print(f"  Debug projected lines FC created: {temp_projected_lines_fc}")
+
+arcpy.CreateFeatureclass_management(
+    out_path=os.path.dirname(temp_intersection_points_fc),
+    out_name=os.path.basename(temp_intersection_points_fc),
+    geometry_type="POINT",
+    spatial_reference=spatial_ref
+)
+print(f"  Debug intersection points FC created: {temp_intersection_points_fc}")
+
+
+# --- Step 4: Load ALL Target Line Geometries (Gag Mazok) ---
+print("\n--- Step 4: Loading ALL Target Line Geometries (Gag Mazok) ---")
+target_geometries = []
+target_feature_count = 0
+with arcpy.da.SearchCursor(target_line_fc, ["SHAPE@"]) as target_cursor:
+    for row in target_cursor:
+        if row[0] is not None:
+            target_geometries.append(row[0])
+            target_feature_count += 1
+
+if not target_geometries:
+    arcpy.AddError(f"Error: No valid features found in Target Line feature class: {target_line_fc}. It might be empty or corrupt.")
+    sys.exit("Script terminated due to missing/invalid Target Line feature.")
+    
+try:
+    # Attempt to merge all target geometries into a single multipart geometry for faster intersection
+    merged_target_geom = arcpy.Polyline(target_geometries, spatial_ref)
+    print(f"  All {target_feature_count} Target Line geometries loaded and merged for efficient intersection.")
+except Exception as e:
+    arcpy.AddWarning(f"  Could not merge target geometries into single multipart feature: {e}")
+    arcpy.AddWarning("  Proceeding with individual target geometries, which might be slower for complex targets.")
+    merged_target_geom = None
+
+
+# --- Step 5: Generate forced horizontal width lines from base line points ---
+print(f"\n--- Step 5: Generating FORCED horizontal width lines from {os.path.basename(base_line_fc)} to {os.path.basename(target_line_fc)} ---")
+lines_created = 0
+points_processed = 0
+failed_intersections_count = 0
+
+# Open all cursors here, ensuring they are deleted in finally block
+out_cursor = arcpy.da.InsertCursor(output_fc, ["SHAPE@", "dist_m", "Azimuth"])
+debug_line_cursor = arcpy.da.InsertCursor(temp_projected_lines_fc, ["SHAPE@"])
+debug_point_cursor = arcpy.da.InsertCursor(temp_intersection_points_fc, ["SHAPE@"])
+
+try:
+    with arcpy.da.SearchCursor(base_line_fc, ["SHAPE@"]) as base_cursor:
+        for row in base_cursor:
+            line_base = row[0]
+            if line_base is None or line_base.length == 0:
+                arcpy.AddWarning(f"  Skipping an empty or zero-length line in {base_line_fc}.")
+                continue
+            
+            length = line_base.length
+            d = 0
+            while d <= length:
+                points_processed += 1
+                
+                start_point_geom = line_base.positionAlongLine(d)
+                start_point = start_point_geom.firstPoint
+
+                # Create a truly horizontal line by keeping Y constant and extending X eastward
+                x_east_end = start_point.X + search_distance_east
+                y_constant = start_point.Y
+                end_point = arcpy.Point(x_east_end, y_constant)
+                long_line = arcpy.Polyline(arcpy.Array([start_point, end_point]), spatial_ref)
+                
+                # --- Debugging: Store this projected line ---
+                debug_line_cursor.insertRow([long_line])
+
+                # Intersection attempt
+                intersect_result = None
+                if merged_target_geom:
+                    intersect_result = long_line.intersect(merged_target_geom, 2)
+                else: # Fallback for non-merged target geometries
+                    for individual_target_geom in target_geometries:
+                        temp_intersect = long_line.intersect(individual_target_geom, 2)
+                        if temp_intersect and temp_intersect.firstPoint is not None:
+                            intersect_result = temp_intersect
+                            break
+                
+                if intersect_result and intersect_result.firstPoint is not None:
+                    inter_point = intersect_result.firstPoint
+                    # *** This is where the line is "cut" at the intersection ***
+                    final_line_geom = arcpy.Polyline(arcpy.Array([start_point, inter_point]), spatial_ref)
+                    out_cursor.insertRow([final_line_geom, final_line_geom.length, 90]) # Azimuth is explicitly 90 for horizontal East
+                    debug_point_cursor.insertRow([inter_point]) # Store the intersection point
+                    lines_created += 1
+                else:
+                    failed_intersections_count += 1
+                    arcpy.AddWarning(f"  Warning: No horizontal intersection found for point at X: {start_point.X:.2f}, Y: {start_point.Y:.2f}. Line not created for this point.")
+                
+                d += spacing_m
+
+except Exception as e:
+    arcpy.AddError(f"An unexpected error occurred during line generation: {e}")
+    sys.exit("Script terminated due to an unexpected error.")
+finally:
+    # Ensure cursors are deleted even if an error occurs to release locks
+    if 'out_cursor' in locals() and out_cursor:
+        del out_cursor
+    if 'debug_line_cursor' in locals() and debug_line_cursor:
+        del debug_line_cursor
+    if 'debug_point_cursor' in locals() and debug_point_cursor:
+        del debug_point_cursor
+
+print("\n--- Script Complete (FORCED Horizontal East-West Lines - 5m Spacing) ---")
+print(f"✅ Width lines created successfully at: {output_fc}")
+print(f"Processed {points_processed} points from {os.path.basename(base_line_fc)}.")
+print(f"Successfully created {lines_created} width lines.")
+if failed_intersections_count > 0:
+    arcpy.AddWarning(f"WARNING: {failed_intersections_count} points failed to intersect the {os.path.basename(target_line_fc)} feature within {search_distance_east}m using forced horizontal projection.")
+    arcpy.AddWarning(f"Lines were NOT created for these {failed_intersections_count} points.")
+else:
+    print(f"All points from {os.path.basename(base_line_fc)} successfully connected to {os.path.basename(target_line_fc)}.")
+
+print(f"\n--- Debugging Information ---")
+print(f"  Check '{temp_projected_lines_fc}' to see the projected lines (these MUST be horizontal, East-West).")
+print(f"  Check '{temp_intersection_points_fc}' to see the found intersection points (if any).")
+print("  If temp_projected_lines.shp does not appear to cross Gag.shp, increase 'search_distance_east' further.")
+print("  If temp_projected_lines.shp clearly crosses Gag.shp but temp_intersection_points.shp is empty, there might be data integrity issues (e.g., Z-values, complex geometry, or spatial reference precision issues) that prevent intersection detection.")
